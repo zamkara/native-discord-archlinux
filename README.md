@@ -45,7 +45,16 @@ native-discord -r ptb             # Remove one native channel package
 ```
 
 In the TUI: arrows select a row; Enter sets the default; `i` installs; `o` opens;
-`r` removes; `q` exits. Terminal colors are inherited. There is no idle service,
+`r` removes; `q` exits. Install/remove progress, transaction plans, cancellation,
+errors and masked administrator-password prompts stay inside the TUI. Confirm a
+package plan with `y`, or cancel with `n` / Escape; long plans scroll with
+Page Up / Page Down. Downloads do not require administrator privileges. Running
+transactions must finish before the TUI can close. Opening Discord leaves the
+TUI running and writes application output to a private channel log under
+`$XDG_STATE_HOME/native-discord` or `~/.local/state/native-discord`.
+The CLI keeps pacman's normal terminal prompts. Current or newer integration
+packages are not reinstalled or downgraded when choosing another channel.
+Terminal colors are inherited. There is no idle service,
 update timer or background watcher. Each channel also has its own application
 menu entry. Multiple channels may coexist; changing the default does not copy
 credentials, change another channel's profile, or close running applications.

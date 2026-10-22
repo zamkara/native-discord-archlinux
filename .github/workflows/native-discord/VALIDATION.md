@@ -4,7 +4,7 @@ Date: 2026-10-22. These results distinguish local checks from GitHub execution.
 
 ## Completed locally
 
-- 24 Python tests passed with no skips. Coverage includes archive traversal,
+- 32 Python tests passed with no skips. Coverage includes archive traversal,
   symlink/device rejection, channel/ELF checks, checksums, incomplete release
   rejection, unchanged-release skip, isolated channel selection, official updater
   handoff, terminal confirmation and clean root layout.
@@ -72,3 +72,15 @@ from the successful build gate.
 - Checksums are integrity checks, not an independent signature of the publisher.
 - Actual application versions are owned by Discord's updater and may exceed the
   pinned bootstrap package version; this is intentional.
+
+## Full-TUI regression validation
+
+The original implementation temporarily left curses for package operations and
+replaced the TUI process on launch. Both behaviors were corrected. A real
+pseudo-terminal test now exercises missing-channel open, installation progress,
+package-plan confirmation, masked password entry, an operation error, continued
+interaction and explicit quit. It asserts there is no alternate-screen exit
+before quit and no plaintext test password in terminal output. Additional tests
+verify captured stdout/stderr, cancellation before sudo, authentication via stdin,
+no same-version manager reinstall/downgrade, and detached Discord launch without
+replacing the TUI process. Tests do not contact the network or change packages.

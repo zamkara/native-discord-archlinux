@@ -2,6 +2,10 @@
 """Install official Discord bootstraps and choose a channel. Discord updates itself."""
 import argparse
 import curses
+from collections import deque
+import queue
+import textwrap
+import threading
 import hashlib
 import json
 import os
@@ -72,7 +76,7 @@ def fetch(url,path):
     # Release downloads are HTTPS and credentials are never passed to redirects.
     subprocess.run(['curl','-fLsS','--proto','=https','--proto-redir','=https',
                     '--retry','3','--connect-timeout','20','--max-time','300',
-                    '-o',str(path),url],check=True)
+                    '-o',str(path),url],check=True,capture_output=True,text=True)
 
 
 def release_catalog():
@@ -112,14 +116,89 @@ def verify(path,sums):
     if h.hexdigest()!=sums[path.name]:raise ValueError('Checksum mismatch: '+path.name)
 
 
-def transaction(arguments):
+class Cancelled(RuntimeError):
+    pass
+
+
+def clean_output(text):
+    text=re.sub(r'\x1b\][^\x07]*(?:\x07|\x1b\\)', '', text)
+    text=re.sub(r'\x1b\[[0-?]*[ -/]*[@-~]', '', text)
+    return ''.join(c for c in text if c in '\n\t' or ord(c)>=32).replace('\t','    ')
+
+
+class ScreenFeedback:
+    def __init__(self,events):self.events=events
+    def log(self,text):
+        for line in clean_output(str(text)).splitlines():
+            self.events.put(('log',line[:2000]))
+    def request(self,kind,text):
+        reply=queue.Queue(maxsize=1)
+        self.events.put(('prompt',(kind,text,reply)))
+        return reply.get()
+
+
+def notify(text,feedback=None):
+    if feedback:feedback.log(text)
+    else:print(text)
+
+
+def capture_command(arguments,feedback,*,input=None,stdout_only=False):
+    """Stream subprocess output into the UI; never inherit its terminal streams."""
+    if input is not None:
+        # Passwords only go through stdin. Never send this command's output to the log.
+        return subprocess.run(arguments,input=input,capture_output=True,text=True)
+    command=subprocess.Popen(arguments,stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,
+                             stderr=subprocess.PIPE if stdout_only else subprocess.STDOUT,
+                             text=True,errors='replace',env={**os.environ,'LC_ALL':'C'})
+    if stdout_only:
+        def read_errors():
+            for line in command.stderr:feedback.log(line)
+        reader=threading.Thread(target=read_errors)
+        reader.start();output=command.stdout.read();code=command.wait();reader.join()
+    else:
+        tail=deque(maxlen=40)
+        for line in command.stdout:
+            feedback.log(line);tail.append(line)
+        output=''.join(tail);code=command.wait()
+    command.stdout.close()
+    if command.stderr:command.stderr.close()
+    if code:raise RuntimeError(f'Command failed (exit {code}): '+clean_output(output[-1000:]).strip())
+    return subprocess.CompletedProcess(arguments,code,output,'')
+
+
+def transaction(arguments,feedback=None):
     if os.geteuid()==0:raise RuntimeError('Run as your regular user; only pacman needs administrator privileges')
-    with open('/dev/tty','rb',buffering=0) as tty:
-        subprocess.run(['sudo','--','/usr/bin/pacman',*arguments],stdin=tty,check=True)
+    if feedback is None:
+        with open('/dev/tty','rb',buffering=0) as tty:
+            subprocess.run(['sudo','--','/usr/bin/pacman',*arguments],stdin=tty,check=True)
+        return
+    plan=subprocess.run(['/usr/bin/pacman','--print','--print-format','%n %v (%s bytes)',*arguments],
+                        capture_output=True,text=True,env={**os.environ,'LC_ALL':'C'})
+    if plan.returncode:raise RuntimeError(clean_output(plan.stderr).strip() or 'Could not resolve package transaction')
+    if not plan.stdout.strip():
+        feedback.log('No package changes needed.');return
+    text=('Remove these packages?' if arguments[0]=='-R' else 'Install these packages?')+'\n\n'+plan.stdout
+    if plan.stderr.strip():text+='\n'+clean_output(plan.stderr)
+    feedback.log(text)
+    if not feedback.request('confirm',text):raise Cancelled('Cancelled. No packages changed.')
+    authenticated=subprocess.run(['/usr/bin/sudo','-n','-v'],stdin=subprocess.DEVNULL,
+                                  stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL).returncode==0
+    if not authenticated:
+        for attempt in range(3):
+            password=feedback.request('password','Administrator password' if attempt==0 else 'Authentication failed. Try again.')
+            if password is None:raise Cancelled('Authentication cancelled. No packages changed.')
+            result=capture_command(['/usr/bin/sudo','-S','-p','','-v'],feedback,input=password+'\n')
+            del password
+            if result.returncode==0:authenticated=True;break
+        if not authenticated:raise RuntimeError('Authentication failed. No packages changed.')
+    capture_command(['/usr/bin/sudo','-n','--','/usr/bin/pacman',
+                     '--noconfirm','--color','never',*arguments],feedback)
+    feedback.log('Package transaction completed.')
 
 
-def install(channel):
+def install(channel,feedback=None):
     if platform.machine()!='x86_64':raise RuntimeError('Official Linux tarballs verified by this builder are x86_64 only')
+    notify('Checking release catalog...',feedback)
     base,sums,catalog=release_catalog()
     packages=catalog['packages']
     with tempfile.TemporaryDirectory(prefix='native-discord-install-') as d:
@@ -128,16 +207,25 @@ def install(channel):
             filename=packages[name]
             if not re.fullmatch(r'native-discord-'+name+r'-[A-Za-z0-9_.+\-]+-x86_64\.pkg\.tar\.zst',filename):
                 raise ValueError('Unexpected package asset')
+            version=filename.removeprefix('native-discord-'+name+'-').removesuffix('-x86_64.pkg.tar.zst')
+            current=subprocess.run(['/usr/bin/pacman','-Q','native-discord-'+name],capture_output=True,text=True)
+            current_version=current.stdout.strip().split(maxsplit=1)[-1] if current.returncode==0 else ''
+            comparison=(subprocess.run(['/usr/bin/vercmp',current_version,version],capture_output=True,text=True)
+                        if current_version and current_version!=version else None)
+            if current_version==version or (comparison and comparison.returncode==0 and int(comparison.stdout)>=0):
+                notify(f'{name.title()} integration is already current.',feedback)
+                continue
+            notify('Downloading '+filename+'...',feedback)
             path=Path(d)/filename;fetch(base+filename,path);verify(path,sums);paths.append(str(path))
         missing=subprocess.run(['/usr/bin/pacman','-T',*DEPS],capture_output=True,text=True)
         if missing.returncode not in (0,127):raise RuntimeError('Could not check system dependencies')
-        if missing.stdout.strip():transaction(['-S','--needed','--',*missing.stdout.splitlines()])
-        transaction(['-U','--',*paths])
+        if missing.stdout.strip():transaction(['-S','--needed','--',*missing.stdout.splitlines()],feedback)
+        if paths:transaction(['-U','--',*paths],feedback)
     select_channel(channel)
-    print(f'{channel.title()} installed. Discord downloads and updates its app directly from Discord on launch.')
+    notify(f'{channel.title()} is ready. Discord handles its own app updates.',feedback)
 
 
-def launch(channel,args):
+def launch(channel,args,feedback=None,detach=False):
     if os.geteuid()==0:raise RuntimeError('Discord must run as your regular user')
     launcher=PREFIX/channel/CHANNELS[channel][0]
     if not installed(channel):raise RuntimeError(f'{channel.title()} is not installed. Run native-discord -i {channel}')
@@ -146,9 +234,10 @@ def launch(channel,args):
         target=host.parent
         target.mkdir(parents=True,exist_ok=True)
         mode="--no-zenity" if sys.stdout.isatty() else "--zenity"
-        result=subprocess.run([str(PREFIX/channel/"updater_bootstrap"),mode,str(target),
-                               channel,"https://updates.discord.com/"],check=True,
-                              stdout=subprocess.PIPE,text=True)
+        command=[str(PREFIX/channel/"updater_bootstrap"),
+                 "--no-zenity" if feedback else mode,str(target),channel,"https://updates.discord.com/"]
+        result=(capture_command(command,feedback,stdout_only=True) if feedback else
+                subprocess.run(command,check=True,stdout=subprocess.PIPE,text=True))
         relative=result.stdout.strip()
         if not re.fullmatch(r'app-[0-9]+(?:\.[0-9]+)+',relative):
             raise RuntimeError('Official bootstrap returned an unexpected application path')
@@ -157,54 +246,130 @@ def launch(channel,args):
             raise RuntimeError('Official bootstrap did not produce an executable application')
     # Launch only the executable produced by Discord's own updater. The packaged
     # official launcher and bootstrap are preserved byte-for-byte.
+    if detach:
+        state=Path(os.environ.get('XDG_STATE_HOME',str(Path.home()/'.local/state')))/'native-discord'
+        state.mkdir(parents=True,exist_ok=True,mode=0o700)
+        log=state/(channel+'.log')
+        if log.exists() and log.stat().st_size>2*1024*1024:
+            log.replace(log.with_suffix('.previous.log'))
+        fd=os.open(log,os.O_WRONLY|os.O_CREAT|os.O_APPEND,0o600)
+        with os.fdopen(fd,'a') as output:
+            child=subprocess.Popen([str(host),*args],stdin=subprocess.DEVNULL,
+                                   stdout=output,stderr=output,start_new_session=True)
+        try:code=child.wait(timeout=0.3)
+        except subprocess.TimeoutExpired:code=None
+        if code not in (None,0):raise RuntimeError(f'Discord exited with code {code}. Log: {log}')
+        notify(channel.title()+' opened.',feedback)
+        return
     os.execv(str(host),[str(host),*args])
 
 
-def remove(channel):
-    transaction(['-R','--','native-discord-'+channel])
-    print('Package removed. Discord profile, account and downloaded app data were preserved.')
+def remove(channel,feedback=None):
+    transaction(['-R','--','native-discord-'+channel],feedback)
+    notify('Package removed. Discord profile, account and downloaded app data were preserved.',feedback)
 
 
 def tui():
     if not sys.stdin.isatty() or not sys.stdout.isatty():raise RuntimeError('An interactive terminal is required')
+    events=queue.Queue(maxsize=256)
+    feedback=ScreenFeedback(events)
     selected=list(CHANNELS).index(active_channel())
-    message='Up/Down Select | Enter Default | i Install | o Open | r Remove | q Quit'
+    logs=deque(maxlen=200)
+    busy=False;prompt=None;password=[];prompt_scroll=0;message='Ready.'
+    states={channel:status(channel) for channel in CHANNELS}
+    current=active_channel()
+
+    def perform(key,channel):
+        try:
+            if key=='i':install(channel,feedback)
+            elif key=='o':launch(channel,[],feedback,detach=True)
+            else:remove(channel,feedback)
+            events.put(('done','Done.'))
+        except Cancelled as error:events.put(('done',str(error)))
+        except Exception as error:
+            feedback.log('Error: '+str(error));events.put(('done',str(error)))
+
     def screen(stdscr):
-        nonlocal selected,message
-        curses.curs_set(0);stdscr.keypad(True)
+        nonlocal selected,busy,prompt,password,prompt_scroll,message,states,current
+        curses.curs_set(0);curses.raw();stdscr.keypad(True)
         while True:
+            while True:
+                try:kind,value=events.get_nowait()
+                except queue.Empty:break
+                if kind=='log':logs.append(value)
+                elif kind=='prompt':prompt=value;password=[];prompt_scroll=0
+                elif kind=='done':
+                    busy=False;message=value
+                    states={channel:status(channel) for channel in CHANNELS};current=active_channel()
             stdscr.erase();h,w=stdscr.getmaxyx()
-            if h<12 or w<64:
-                stdscr.addnstr(0,0,'Resize terminal to at least 64 x 12. Press q to quit.',max(0,w-1))
-                stdscr.refresh()
-                if stdscr.getch() in (ord('q'),27):return
+            stdscr.timeout(100 if busy else -1)
+            if h<18 or w<72:
+                stdscr.addnstr(0,0,'Resize to at least 72 x 18. Transactions remain active.',max(0,w-1))
+                stdscr.refresh();key=stdscr.getch()
+                if key in (ord('q'),27,3) and not busy:return
                 continue
-            def line(y,text,attr=0):stdscr.addnstr(y,2,text,w-4,attr)
+            def line(y,text,attr=0):
+                if 0<=y<h:stdscr.addnstr(y,2,clean_output(text),w-4,attr)
             line(1,'Native Discord')
-            line(2,'Official Discord clients. App updates are handled by Discord.')
+            line(2,'Official clients. App updates are handled by Discord.')
             for i,channel in enumerate(CHANNELS):
-                mark='*' if channel==active_channel() else ' '
+                mark='*' if channel==current else ' '
                 label='PTB' if channel=='ptb' else channel.title()
-                line(4+i,f'{mark} {label:<14} {status(channel)}',curses.A_REVERSE if i==selected else 0)
-            line(h-3,message);line(h-2,'* Default channel. Profiles stay separate when switching.')
-            stdscr.refresh();key=stdscr.getch()
-            if key in (ord('q'),27):return
-            if key in (curses.KEY_UP,ord('k')):selected=(selected-1)%len(CHANNELS)
-            elif key in (curses.KEY_DOWN,ord('j')):selected=(selected+1)%len(CHANNELS)
-            elif key in (10,13,curses.KEY_ENTER):
-                select_channel(list(CHANNELS)[selected]);message='Default channel changed. Press o to open.'
-            elif key in (ord('i'),ord('o'),ord('r')):
+                line(4+i,f'{mark} {label:<14} {states[channel]}',curses.A_REVERSE if i==selected else 0)
+            line(9,'Activity')
+            for y,text in enumerate(list(logs)[-max(0,h-15):],11):line(y,text)
+            line(h-4,message)
+            line(h-3,'Working...' if busy else 'Up/Down Select | Enter Default | i Install | o Open | r Remove')
+            line(h-2,'Wait for the transaction to finish.' if busy else '* Default channel | q Quit')
+            if prompt:
+                kind,text,reply=prompt
+                wrapped=[]
+                for part in clean_output(text).splitlines():
+                    wrapped.extend(textwrap.wrap(part,w-8) or [''])
+                # A dedicated screen keeps long plans visible without exposing terminal output.
+                stdscr.erase()
+                line(1,'Authentication' if kind=='password' else 'Confirm package transaction')
+                prompt_scroll=min(prompt_scroll,max(0,len(wrapped)-(h-7)))
+                for y,text in enumerate(wrapped[prompt_scroll:prompt_scroll+h-7],3):line(y,text)
+                if len(wrapped)>h-7:line(h-3,'PgUp/PgDn: scroll the package plan')
+                if kind=='password':
+                    line(h-3,'Password: '+'*'*min(len(password),w-16))
+                    line(h-2,'Enter Submit | Esc Cancel')
+                else:line(h-2,'y Confirm | n / Esc Cancel')
+            stdscr.refresh()
+            try:key=stdscr.get_wch()
+            except curses.error:continue
+            if prompt:
+                kind,text,reply=prompt
+                if key in ('\x1b','\x03') or (kind=='confirm' and key in ('n','N')):
+                    reply.put(None if kind=='password' else False);prompt=None;password=[]
+                elif kind=='confirm' and key in (curses.KEY_NPAGE,curses.KEY_PPAGE):
+                    prompt_scroll=max(0,prompt_scroll+(h-7)*(1 if key==curses.KEY_NPAGE else -1))
+                elif kind=='confirm' and key in ('y','Y'):
+                    reply.put(True);prompt=None
+                elif kind=='password':
+                    if key in ('\n','\r',curses.KEY_ENTER):
+                        reply.put(''.join(password));prompt=None;password=[]
+                    elif key in ('\b','\x7f',curses.KEY_BACKSPACE):
+                        if password:password.pop()
+                    elif isinstance(key,str) and key.isprintable() and len(password)<1024:password.append(key)
+                continue
+            if busy:
+                if key in ('q','\x1b','\x03'):message='Transaction running. Wait for completion; nothing was interrupted.'
+                continue
+            if key in ('q','\x1b','\x03'):return
+            if key in (curses.KEY_UP,'k'):selected=(selected-1)%len(CHANNELS)
+            elif key in (curses.KEY_DOWN,'j'):selected=(selected+1)%len(CHANNELS)
+            elif key in ('\n','\r',curses.KEY_ENTER):
+                select_channel(list(CHANNELS)[selected]);current=active_channel()
+                message='Default channel changed. Press o to open.'
+            elif key in ('i','o','r'):
                 channel=list(CHANNELS)[selected]
-                curses.def_prog_mode();curses.endwin()
-                try:
-                    if key==ord('i'):install(channel)
-                    elif key==ord('o'):launch(channel,[])
-                    else:remove(channel)
-                    message='Done.'
-                except Exception as error:
-                    print('Error:',error,file=sys.stderr);message=str(error)
-                finally:
-                    curses.reset_prog_mode();stdscr.clear()
+                if key in ('o','r') and not installed(channel):
+                    message=channel.title()+' is not installed. Press i to install.'
+                    continue
+                busy=True;message={'i':'Preparing installation...','o':'Opening Discord...','r':'Preparing removal...'}[key]
+                logs.clear();threading.Thread(target=perform,args=(key,channel),daemon=True).start()
     curses.wrapper(screen)
 
 
