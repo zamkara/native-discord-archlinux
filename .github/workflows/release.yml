@@ -1,0 +1,98 @@
+name: Native Discord
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 3 * * *'
+      timezone: America/Los_Angeles
+permissions:
+  contents: read
+concurrency:
+  group: native-discord-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Test builder, updater handoff, safety and layout
+        run: |
+          python3 -m unittest discover -s .github/workflows/native-discord/tests -v
+          python3 -m compileall -q .github/workflows/native-discord
+          bash -n .github/workflows/native-discord/container-build.sh
+          bash -n .github/workflows/native-discord/install.sh.in
+  prepare:
+    if: github.event_name != 'pull_request'
+    needs: validate
+    runs-on: ubuntu-latest
+    outputs:
+      build: ${{ steps.plan.outputs.build }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - id: plan
+        name: Pin all four official archives and check for an identical complete release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          REVISION: ${{ github.sha }}
+        run: python3 .github/workflows/native-discord/prepare.py --output .github/workflows/.build/inputs --repository "$REPOSITORY" --revision "$REVISION"
+      - if: steps.plan.outputs.build == 'true'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: pinned-inputs
+          path: .github/workflows/.build/inputs/
+          retention-days: 2
+          if-no-files-found: error
+  build:
+    needs: prepare
+    if: needs.prepare.outputs.build == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+        with:
+          name: pinned-inputs
+          path: .github/workflows/.build/inputs
+      - name: Build, install, verify and uninstall in a clean Arch container
+        run: |
+          mkdir -p .github/workflows/.build/release
+          docker run --rm \
+            -e SOURCE_DATE_EPOCH="$(git show -s --format=%ct HEAD)" \
+            -v "$PWD:/repo:ro" \
+            -v "$PWD/.github/workflows/.build/inputs:/inputs:ro" \
+            -v "$PWD/.github/workflows/.build/release:/output" \
+            archlinux:base bash /repo/.github/workflows/native-discord/container-build.sh
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: verified-suite
+          path: .github/workflows/.build/release/
+          retention-days: 7
+          if-no-files-found: error
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+        with:
+          name: verified-suite
+          path: .github/workflows/.build/release
+      - name: Publish a complete non-prerelease suite with one-line installer
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          REVISION: ${{ github.sha }}
+        run: python3 .github/workflows/native-discord/publish.py .github/workflows/.build/release --repository "$REPOSITORY" --revision "$REVISION"

@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+set -euo pipefail
+repo='@REPOSITORY@'
+tag='@TAG@'
+channel=${1:-stable}
+case "$channel" in stable|ptb|canary|development) ;; *) echo 'Unknown channel' >&2; exit 2 ;; esac
+[[ $(uname -m) == x86_64 ]] || { echo 'Official tarballs are supported on x86_64 only.' >&2; exit 1; }
+[[ $EUID -ne 0 ]] || { echo 'Run as your regular user; only pacman requests sudo.' >&2; exit 1; }
+[[ -r /dev/tty ]] || { echo 'An interactive terminal is required for installation.' >&2; exit 1; }
+for tool in curl python3; do
+  command -v "$tool" >/dev/null || { echo "Required: $tool. Install python and curl with pacman first." >&2; exit 1; }
+done
+work=$(mktemp -d)
+trap 'rm -rf -- "$work"' EXIT
+base="https://github.com/$repo/releases/download/$tag"
+curl -fLsS --proto '=https' --proto-redir '=https' --retry 3 "$base/SHA256SUMS" -o "$work/SHA256SUMS"
+curl -fLsS --proto '=https' --proto-redir '=https' --retry 3 "$base/native-discord" -o "$work/native-discord"
+python3 - "$work" <<'PY'
+import hashlib,pathlib,re,sys
+root=pathlib.Path(sys.argv[1]);entries={}
+for line in (root/'SHA256SUMS').read_text().splitlines():
+ m=re.fullmatch(r'([a-f0-9]{64})  ([A-Za-z0-9_.+\-]+)',line)
+ if not m or m[2] in entries:raise SystemExit('Invalid checksum manifest')
+ entries[m[2]]=m[1]
+actual=hashlib.sha256((root/'native-discord').read_bytes()).hexdigest()
+if entries.get('native-discord')!=actual:raise SystemExit('Installer checksum mismatch')
+print('native-discord: verified')
+PY
+# stdin is the downloaded installer when piped; pacman confirmation uses /dev/tty.
+NATIVE_DISCORD_RELEASE="$tag" python3 "$work/native-discord" -i "$channel"
