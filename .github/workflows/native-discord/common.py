@@ -48,8 +48,8 @@ def download(url, destination):
     return result.stdout.strip()
 
 
-def gh_json(*args):
-    p=subprocess.run(['gh',*args],capture_output=True,text=True)
+def gh_json(*args, input=None):
+    p=subprocess.run(['gh',*args],input=input,capture_output=True,text=True)
     if p.returncode:
         if 'HTTP 404' in p.stderr or 'release not found' in p.stderr.lower():return None
         raise RuntimeError(p.stderr.strip() or 'GitHub request failed')

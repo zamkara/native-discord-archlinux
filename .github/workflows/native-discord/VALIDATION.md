@@ -4,7 +4,7 @@ Date: 2026-10-22. These results distinguish local checks from GitHub execution.
 
 ## Completed locally
 
-- 21 Python tests passed with no skips. Coverage includes archive traversal,
+- 24 Python tests passed with no skips. Coverage includes archive traversal,
   symlink/device rejection, channel/ELF checks, checksums, incomplete release
   rejection, unchanged-release skip, isolated channel selection, official updater
   handoff, terminal confirmation and clean root layout.
@@ -47,9 +47,17 @@ Official inputs tested:
 
 The workflow repeats the build in a fresh updated Arch container, installs and
 verifies all five packages, checks bootstrap shared libraries and desktop files,
-then uninstalls the suite. Publication depends on this job succeeding. A local
-container run is also in progress; no completed result is claimed here yet.
-GitHub publication is not claimed until the first workflow completes.
+then uninstalls the suite. Publication depends on this job succeeding. The local container run passed: all five packages built, installed, reported zero
+altered files, and uninstalled successfully. The first GitHub run also passed
+validation, input preparation and the clean-container build/install/uninstall gate.
+
+The first publication attempt exposed a draft-release API behavior: querying a
+new draft by tag returned 404 even though its assets were uploaded successfully.
+The publisher now discovers drafts through the paginated release list and uses
+numeric release IDs for upload, verification and publication. Three regression
+tests cover a new draft, resuming an existing draft without duplication, and
+refusing to publish an incomplete upload. Publication is verified separately
+from the successful build gate.
 
 ## Not claimed
 

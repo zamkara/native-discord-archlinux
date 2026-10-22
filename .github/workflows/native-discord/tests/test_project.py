@@ -158,6 +158,39 @@ class PublishTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError,'four-channel'):publish.validate(root)
 
 
+class DraftPublicationTests(unittest.TestCase):
+    def exercise(self,resume=False,incomplete=False):
+        with tempfile.TemporaryDirectory() as d:
+            root=Path(d)/'release';root.mkdir();(root/'package').write_bytes(b'archive')
+            tag='sha-'+'b'*64
+            catalog={'tag':tag,'repository':'owner/repo','builder':'a'*40,'digest':'b'*64,'channels':[]}
+            draft={'id':42,'draft':True,'tag_name':tag,'assets':[]}
+            def api(*args,**kwargs):
+                if '--paginate' in args:return [[draft]] if resume else [[]]
+                if '--method' in args:
+                    method=args[args.index('--method')+1]
+                    if method=='POST':return draft
+                    if method=='PATCH':return {'id':42,'draft':False,'prerelease':False,'html_url':'https://example.test/release'}
+                self.assertEqual(args,('api','repos/owner/repo/releases/42'))
+                return {'assets':[] if incomplete else [{'name':'package','size':7}]}
+            with patch.object(publish,'validate',return_value=catalog),patch.object(publish,'gh_json',side_effect=api) as requests,patch.object(publish.subprocess,'run') as run,patch('sys.stdout',new=io.StringIO()):
+                if incomplete:
+                    with self.assertRaisesRegex(RuntimeError,'Incomplete upload'):publish.publish(root,'owner/repo','a'*40)
+                else:publish.publish(root,'owner/repo','a'*40)
+                calls=[c.args for c in requests.call_args_list]
+                self.assertFalse(any('/tags/' in arg for call in calls for arg in call))
+                self.assertTrue(any('/releases/42' in arg for call in calls for arg in call))
+                self.assertIn('https://uploads.github.com/repos/owner/repo/releases/42/assets?name=package',run.call_args.args[0])
+                posts=[c for c in calls if '--method' in c and c[c.index('--method')+1]=='POST']
+                self.assertEqual(len(posts),0 if resume else 1)
+                patches=[c for c in calls if '--method' in c and c[c.index('--method')+1]=='PATCH']
+                self.assertEqual(len(patches),0 if incomplete else 1)
+
+    def test_new_draft_publishes_by_id_when_tag_lookup_would_404(self):self.exercise()
+    def test_existing_draft_is_resumed_without_duplicate(self):self.exercise(resume=True)
+    def test_incomplete_upload_stays_draft(self):self.exercise(incomplete=True)
+
+
 class LayoutTests(unittest.TestCase):
     def test_clean_root(self):
         self.assertEqual({p.name for p in ROOT.iterdir() if p.name!='.git'},{'README.md','LICENSE','.github'})

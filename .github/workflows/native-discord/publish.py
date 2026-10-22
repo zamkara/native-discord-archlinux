@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 import re
 import subprocess
+from urllib.parse import quote
 
 from common import CHANNELS, gh_json, repository, sha256
 
@@ -27,7 +28,11 @@ def validate(root):
 def publish(root, repo, revision):
     catalog=validate(root);repo=repository(repo);tag=catalog['tag']
     if catalog['repository']!=repo or catalog['builder']!=revision:raise ValueError('Release identity mismatch')
-    release=gh_json('api',f'repos/{repo}/releases/tags/{tag}')
+    # Draft tag endpoints can return 404 until publication. Resolve drafts from
+    # the release list and use the immutable numeric release ID for every mutation.
+    pages=gh_json('api','--paginate','--slurp',f'repos/{repo}/releases?per_page=100')
+    matches=[r for page in pages for r in page if r.get('tag_name')==tag]
+    release=next((r for r in matches if not r.get('draft')), matches[0] if matches else None)
     if release and not release.get('draft'):
         raise RuntimeError('This release already exists; refusing to overwrite a published release')
     note=root.parent/'release-notes.md'
@@ -41,16 +46,33 @@ def publish(root, repo, revision):
               'These are official proprietary binaries repackaged into native Arch packages, not a source rebuild or a Discord-endorsed release. Discord’s own licenses apply to Discord; the Almatera license applies to this builder.']
     note.write_text('\n'.join(lines)+'\n')
     if not release:
-        subprocess.run(['gh','release','create',tag,'--repo',repo,'--target',revision,'--draft',
-                        '--title','Native Discord '+catalog['digest'][:12],
-                        '--notes-file',str(note)],check=True)
-    subprocess.run(['gh','release','upload',tag,'--repo',repo,'--clobber',
-                    *map(str,sorted(root.iterdir()))],check=True)
-    staged=gh_json('api',f'repos/{repo}/releases/tags/{tag}')
+        release=gh_json('api','--method','POST',f'repos/{repo}/releases','--input','-',
+                        input=json.dumps({'tag_name':tag,'target_commitish':revision,
+                          'draft':True,'prerelease':False,'name':'Native Discord '+catalog['digest'][:12],
+                          'body':note.read_text()}))
+    if not release or not isinstance(release.get('id'),int):
+        raise RuntimeError('GitHub did not return a release ID')
+    release_id=release['id']
+    endpoint=f'repos/{repo}/releases/{release_id}'
+    assets={a['name']:a['id'] for a in release.get('assets',[])}
+    for path in sorted(root.iterdir()):
+        if path.name in assets:
+            subprocess.run(['gh','api','--method','DELETE',
+                            f'repos/{repo}/releases/assets/{assets[path.name]}'],check=True)
+        upload=f'https://uploads.github.com/{endpoint}/assets?name={quote(path.name,safe="")}'
+        subprocess.run(['gh','api','--method','POST','--header','Content-Type: application/octet-stream',
+                        upload,'--input',str(path)],check=True,stdout=subprocess.DEVNULL)
+    staged=gh_json('api',endpoint)
+    if not staged:raise RuntimeError('Uploaded release could not be read by its ID')
     remote={a['name']:a['size'] for a in staged['assets']}
     for path in root.iterdir():
         if remote.get(path.name)!=path.stat().st_size:raise RuntimeError('Incomplete upload: '+path.name)
-    subprocess.run(['gh','release','edit',tag,'--repo',repo,'--draft=false','--prerelease=false','--latest'],check=True)
+    published=gh_json('api','--method','PATCH',endpoint,'--input','-',
+                     input=json.dumps({'draft':False,'prerelease':False,'make_latest':'true'}))
+    if not published or published.get('draft') or published.get('prerelease'):
+        raise RuntimeError('GitHub did not confirm a published stable release')
+    print(published['html_url'])
+
 
 
 if __name__=='__main__':
