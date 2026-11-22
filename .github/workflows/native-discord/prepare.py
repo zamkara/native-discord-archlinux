@@ -18,9 +18,12 @@ def describe(path, channel, url):
         for name in (launcher,'updater_bootstrap','discord.png'):
             m=members.get(folder+'/'+name)
             if m is None or not m.isfile():raise ValueError(f'{channel}: upstream layout changed: {name}')
-        body=archive.extractfile(members[folder+'/'+launcher]).read().decode()
-        if not re.search(r'^CHANNEL='+re.escape(channel)+r'\s*$',body,re.M):
-            raise ValueError(f'{channel}: launcher channel mismatch')
+        body=archive.extractfile(members[folder+'/'+launcher]).read()
+        if body.startswith(b'#!'):
+            if not re.search(r'^CHANNEL='+re.escape(channel)+r'\s*$',body.decode(),re.M):
+                raise ValueError(f'{channel}: launcher channel mismatch')
+        elif body[:4]!=b'\x7fELF' or int.from_bytes(body[18:20],'little')!=62:
+            raise ValueError(f'{channel}: unsupported launcher format')
         boot=archive.extractfile(members[folder+'/updater_bootstrap']).read(20)
         if boot[:4]!=b'\x7fELF' or int.from_bytes(boot[18:20],'little')!=62:
             raise ValueError('Only an official Linux x86_64 bootstrap is supported')
