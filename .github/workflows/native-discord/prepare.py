@@ -24,7 +24,7 @@ def describe(path, channel, url):
         boot=archive.extractfile(members[folder+'/updater_bootstrap']).read(20)
         if boot[:4]!=b'\x7fELF' or int.from_bytes(boot[18:20],'little')!=62:
             raise ValueError('Only an official Linux x86_64 bootstrap is supported')
-    version=re.search(r'/apps/linux/([0-9]+(?:\.[0-9]+)+)/',url)
+    version=re.search(r'/(?:apps/linux|distro/app/[^/]+/linux/x64)/([0-9]+(?:\.[0-9]+)+)/',url)
     if not version:raise ValueError('Version missing from the final official URL')
     return {'channel':channel,'version':version[1],'url':url,'sha256':sha256(path),
             'archive':path.name,'architecture':'x86_64'}
